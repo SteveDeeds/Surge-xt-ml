@@ -123,9 +123,154 @@ To render a saved native VST3 preset:
 & .\.venv\Scripts\python.exe surge_dataset.py --preset data\initial_patch\patch.vstpreset --output data\repeat
 ```
 
-Pedalboard accepts `.vstpreset`, not Surge's factory `.fxp` files. Native `.fxp`
-loading and deeper modulation control are reasons to consider the official
-`surgepy` bindings later; these require a native source build.
+Pedalboard's `load_preset()` accepts `.vstpreset`, not Surge's factory `.fxp`.
+The batch workflow below adds a version-specific native-state bridge for Surge
+FXP files, including their embedded wavetables. The official `surgepy` bindings
+remain another option for deeper engine control, but require a native build.
+
+## Ten-patch paired repeat experiment
+
+```powershell
+$env:OPENBLAS_NUM_THREADS = '1'
+$env:OMP_NUM_THREADS = '1'
+$env:MKL_NUM_THREADS = '1'
+$env:NUMBA_NUM_THREADS = '1'
+& .\.venv\Scripts\python.exe surge_batch.py
+& .\.venv\Scripts\python.exe -m scripts.validate_batch data\factory_ten
+```
+
+The batch selects ten factory patches: FM Bass 1, Artificial 1, Acidofil,
+Alias Pornography, Brassy, Clarinet, 80s Gliss, Drum One, 1804, and Aggero.
+The source filenames and embedded display names can differ; both are recorded.
+
+For **each original and sanitized variant**, it records the complete 36-point
+grid **three times**: 2,160 WAVs and 72 minutes of audio in total. Individual
+recordings are kept; waveforms are never averaged. The original factory files,
+engine-normalized original states, sanitized states, and exact sanitizer edits
+are preserved separately.
+
+### Sanitizer policy and limitations
+
+The installed engine first loads/resaves each factory patch so old revisions and
+modulation-source IDs are migrated before editing. The sanitizer:
+
+- Enables retrigger on all six oscillator slots (including inactive slots).
+- Sets scene A/B drift to zero and removes modulation routes targeting drift.
+- Sets **all 24 LFO slots** (six voice plus six scene per scene) to Keytrigger.
+- Removes Random Bipolar/Unipolar and Alternate Bipolar/Unipolar modulation routes.
+- Retains noise/S&H/formula LFO shapes, noise oscillators, effects, and the original
+  configured LFO start phase. These potential residual sources are audited.
+
+The saved sanitizer report records before/after controls and removed routes.
+The engine's saved state is read back to verify that requested edits persisted.
+Original patch semantics are not conflated with their sanitized derivatives.
+There is **no claim of deterministic audio** and no accessible external RNG seed.
+Retrigger does not guarantee a zero-degree phase for every oscillator algorithm.
+Freerun advances with DSP/transport state, not necessarily wall-clock time.
+
+Before every recording, the complete variant state is restored and processed
+through the same discarded 100 ms pre-roll. Each variant additionally undergoes
+two-second MIDI-free silence checks before and after the grid. A residual peak
+at or above `1e-7` fails the batch rather than silently accepting possible bleed.
+These checks do not claim that every free-running FX LFO or PRNG has a resettable
+phase; that remaining variation is measured.
+
+Some factory patches can legitimately be silent at parts of the grid (key splits,
+filtering, or velocity mapping). Such cells are retained with explicit silence
+flags. Entirely silent variants fail. Above-full-scale float WAVs are preserved
+without clipping or normalization and are flagged.
+
+### Repeats, spectral uncertainty, and comparisons
+
+Under `data/factory_ten/<patch-id>/<original|sanitized>/`:
+
+- `features_r0.npz` through `features_r2.npz`: individual feature grids.
+- `feature_mean.npz` and `feature_variance.npz`: per-cell arithmetic feature means
+  and **sample variance (`ddof=1`)** across repeats, not across pitch or velocity.
+- `repeatability.npz`: all three repeat-pair distances at every grid point.
+- `audio/`, `patch.vstpreset`, `manifest.json`, and `preview.png`.
+
+The feature keys from the first baseline are retained, plus `stft_short_power`
+with FFT size 2048 and shape `(9, 4, 1025, 188)`. Both STFTs use the same hop and
+frame centers. Their different windows provide a first multi-resolution comparison.
+
+The repeatability metrics are:
+
+1. **Multi-resolution magnitude distance:** for each STFT size,
+   `||sqrt(P1)-sqrt(P2)|| / ((||sqrt(P1)||+||sqrt(P2)||)/2)`, averaged over the two
+   resolutions. It is phase-insensitive but remains sensitive to spectral/loudness
+   changes. This is a measurement, not a trained loss/model.
+2. **Active-bin log-mel RMS difference in dB:** bins within 60 dB of that grid
+   cell's mean-log-mel maximum, restricted to frames with mean RMS above `1e-5`.
+   Cells without active signal are explicitly counted; their zero distance must
+   not be interpreted as a successful timbral match.
+3. **Waveform-identical cells:** hashes detect bit-identical repeats separately
+   from the spectral metrics. Nonidentical waveforms do not imply perceptually
+   significant differences.
+
+The mean of log-mel values is **not** the log-mel of averaged power. Both are saved:
+`log_mel_db` in `feature_mean.npz` is the former, while
+`log_mel_of_mean_power` is computed from the averaged long-window STFT power.
+MFCC means/variances refer to the individual-repeat MFCCs. They are not calculated
+by taking the MFCC of an averaged waveform.
+
+`batch.json` records source/plugin/code hashes, environment and settings. The
+`pipeline/` directory freezes the exact rendering source files behind those hashes.
+`validation.json` and `comparison.csv` are produced only after saved WAVs,
+feature shapes, means, variances, checksums, and repeat metrics are verified.
+The comparison lets us inspect improvement or degradation rather than assuming
+sanitization always reduces variability.
+
+Three repeats give a small-sample within-patch uncertainty estimate, not proof of
+determinism or invariance across fresh processes, machines, or engine versions.
+Keep all repeats and both variants of a source patch in the same ML dataset split.
+Treating them as independent patch examples would leak patch identity.
+
+## Repeatability-only training subset
+
+Variation stays in the acquisition/verification data, **not** as an added training
+tensor dimension. The approved initial eligibility limits are:
+
+- Relative spectral-magnitude distance **at most 1% at each STFT resolution**.
+- Active-bin log-mel RMS difference **at most 0.1 dB**.
+- Both conditions must hold for **every repeat pair and all 36 pitch/velocity cells**.
+  An average across resolutions, notes, or repeat pairs cannot hide a failure.
+- A cell without active signal is insufficient evidence, not an automatic pass;
+  that patch is excluded from this initial full-grid training subset.
+
+These are engineering starting limits, not established perceptual thresholds.
+Only sanitized variants are considered. No extra FX disabling or texture removal
+is used to force marginal patches through the gate.
+
+After the full source batch passes saved-data validation:
+
+```powershell
+& .\.venv\Scripts\python.exe surge_repeatability.py
+& .\.venv\Scripts\python.exe -m scripts.validate_selection data\repeatable_ten
+```
+
+The selector first screens all three existing repeats. It then renders each
+shortlisted patch's full grid in **two fresh Python processes**, each creating a
+new plugin instance. It compares all pairs among canonical repeat zero and both
+fresh runs using the same limits, with additional tail-isolation checks.
+Passing here establishes measured repeatability for this engine and grid, not
+universal determinism under every environment or host setting.
+
+`data/repeatable_ten/selection.json` lists accepted and excluded patches, worst-case
+errors, failure locations, hashes, and the fresh-process evidence. Each accepted
+patch references **one canonical feature grid and 36 canonical WAVs** from repeat
+zero. Resolve a recording's relative `path` against its `variant_directory`.
+There is no repeat dimension: the training collection is
+`patch x pitch x velocity x feature x time`.
+
+The original and repeated diagnostic data remain untouched. Rejected patches do
+not appear in `accepted`; they are not silently averaged into apparently stable
+examples. Different patch variants and verification repeats must still remain in
+the same dataset split if reused for later experiments.
+
+`--resume` skips complete variants only when source, code, plugin, state hashes,
+and numerical thread settings match. An incomplete variant requires inspection and deliberate relocation before
+resuming; existing results are never silently overwritten.
 
 ## Scope and next experiment
 
@@ -133,8 +278,7 @@ No DNN/CNN, learned embedding, patch inference, or inverse synthesis is trained
 yet. One patch validates the acquisition pipeline; it cannot establish a latent
 space that distinguishes patches.
 
-Next, collect multiple patches (including velocity-sensitive and long-FX patches),
-compare these representations, and evaluate embeddings with patch-held-out
+Next, compare the paired multi-patch representations and evaluate embeddings with patch-held-out
 splits. Fit any dataset normalization on the training split only; do not remove
 velocity-dependent loudness independently from each example.
 
@@ -152,3 +296,6 @@ so that test must not be blindly applied to them.
 - [Windows VST3 bundle-path issue](https://github.com/spotify/pedalboard/issues/433)
 - [Surge XT 1.3.4 patch loading](https://github.com/surge-synthesizer/surge/blob/f7b97c682ade0b87da85ca5968b63d5c7c98e68d/src/common/SurgeSynthesizerIO.cpp#L421)
 - [Surge XT 1.3.4 FX recreation](https://github.com/surge-synthesizer/surge/blob/f7b97c682ade0b87da85ca5968b63d5c7c98e68d/src/common/SurgeSynthesizer.cpp#L2991)
+- [Surge native patch serialization and modulation migration](https://github.com/surge-synthesizer/surge/blob/f7b97c682ade0b87da85ca5968b63d5c7c98e68d/src/common/SurgePatch.cpp)
+- [Surge modulation-source IDs](https://github.com/surge-synthesizer/surge/blob/f7b97c682ade0b87da85ca5968b63d5c7c98e68d/src/common/ModulationSource.h)
+- [JUCE MemoryBlock state encoding](https://github.com/juce-framework/JUCE/blob/7.0.12/modules/juce_core/memory/juce_MemoryBlock.cpp)

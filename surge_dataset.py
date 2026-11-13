@@ -7,6 +7,7 @@ import json
 import platform
 import warnings
 from datetime import datetime, timezone
+from functools import cache
 from pathlib import Path
 
 import librosa
@@ -52,17 +53,20 @@ def note_events(note: int, velocity: int) -> list[tuple[bytes, float]]:
     ]
 
 
-def validate_audio(audio: FloatArray) -> None:
+def validate_audio(audio: FloatArray, *, require_signal: bool = True) -> None:
     expected = (2, int(SAMPLE_RATE * (HOLD_SECONDS + TAIL_SECONDS)))
     if audio.shape != expected:
         raise ValueError(f"Expected stereo audio {expected}, got {audio.shape}")
     if not np.isfinite(audio).all():
         raise ValueError("Synth returned nonfinite audio")
-    if np.max(np.abs(audio)) < 1e-8:
+    if require_signal and np.max(np.abs(audio)) < 1e-8:
         raise ValueError("Synth returned a silent recording")
 
 
-def render_note(plugin: VST3Plugin, state: bytes, note: int, velocity: int) -> FloatArray:
+def render_note(
+    plugin: VST3Plugin, state: bytes, note: int, velocity: int, *,
+    require_signal: bool = True,
+) -> FloatArray:
     plugin.preset_data = state
     # Surge applies queued patch loads on the audio thread, before it can keep MIDI notes.
     plugin.process(
@@ -73,21 +77,28 @@ def render_note(plugin: VST3Plugin, state: bytes, note: int, velocity: int) -> F
         note_events(note, velocity), duration=HOLD_SECONDS + TAIL_SECONDS,
         sample_rate=SAMPLE_RATE, num_channels=2, buffer_size=512, reset=False,
     )
-    validate_audio(audio)
+    validate_audio(audio, require_signal=require_signal)
     return audio
 
 
-def extract_features(audio: FloatArray) -> dict[str, FloatArray]:
-    validate_audio(audio)
+@cache
+def mel_filterbank() -> FloatArray:
+    return librosa.filters.mel(
+        sr=SAMPLE_RATE, n_fft=N_FFT, n_mels=N_MELS, fmin=0.0,
+        fmax=SAMPLE_RATE / 2, htk=False, norm="slaney",
+    )
+
+
+def extract_features(
+    audio: FloatArray, *, require_signal: bool = True,
+) -> dict[str, FloatArray]:
+    validate_audio(audio, require_signal=require_signal)
     spectrum = librosa.stft(
         audio, n_fft=N_FFT, hop_length=HOP_LENGTH, center=True, pad_mode="constant"
     )
     # Average channel powers rather than waveforms to avoid stereo phase cancellation.
     power = np.mean(np.abs(spectrum) ** 2, axis=0).astype(np.float32)
-    mel = librosa.filters.mel(
-        sr=SAMPLE_RATE, n_fft=N_FFT, n_mels=N_MELS, fmin=0.0,
-        fmax=SAMPLE_RATE / 2, htk=False, norm="slaney",
-    ) @ power
+    mel = mel_filterbank() @ power
     log_mel = librosa.power_to_db(mel, ref=1.0, amin=1e-10, top_db=None)
     mfcc = librosa.feature.mfcc(S=log_mel, n_mfcc=N_MFCC, dct_type=2, norm="ortho")
     channel_rms = librosa.feature.rms(
