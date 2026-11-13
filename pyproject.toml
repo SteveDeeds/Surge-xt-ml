@@ -1,0 +1,19 @@
+[project]
+name = "surge-xt-ml"
+version = "0.1.0"
+description = "Headless Surge XT pitch/velocity sampling and audio representations"
+requires-python = ">=3.12"
+dependencies = [
+    "pedalboard>=0.9.22,<0.10",
+    "numpy>=2,<3",
+    "librosa>=0.11,<0.12",
+    "soundfile>=0.13,<0.14",
+    "matplotlib>=3.10,<4",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
